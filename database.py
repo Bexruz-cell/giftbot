@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT OR IGNORE INTO settings (key, value) VALUES ('gifts_enabled', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_enabled', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('donation_ask_enabled', '1');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('extra_admins', '');
 """
 
 
@@ -128,6 +129,30 @@ class Database:
         new_val = "0" if val == "1" else "1"
         await self.set_setting("donation_ask_enabled", new_val)
         return new_val == "1"
+
+    # ── Admin management ──────────────────────────────────────────────────────
+
+    async def get_extra_admins(self) -> list[int]:
+        raw = await self.get_setting("extra_admins")
+        if not raw:
+            return []
+        return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+
+    async def add_admin(self, user_id: int) -> bool:
+        admins = await self.get_extra_admins()
+        if user_id in admins:
+            return False
+        admins.append(user_id)
+        await self.set_setting("extra_admins", ",".join(str(a) for a in admins))
+        return True
+
+    async def remove_admin(self, user_id: int) -> bool:
+        admins = await self.get_extra_admins()
+        if user_id not in admins:
+            return False
+        admins = [a for a in admins if a != user_id]
+        await self.set_setting("extra_admins", ",".join(str(a) for a in admins))
+        return True
 
     # ── Users ─────────────────────────────────────────────────────────────────
 
