@@ -1,17 +1,11 @@
-[app]
-name = "giftbot-riyoshop"
-primary_region = "ams"
+app = "giftbot-riyoshop"
+  primary_region = "ams"
 
-[build]
-dockerfile = "Dockerfile"
+  [build]
+    dockerfile = "Dockerfile"
 
-[env]
-
-[[services]]
-internal_port = 8080
-protocol = "tcp"
-
-[[vm]]
-memory = "256mb"
-cpu_kind = "shared"
-cpus = 1
+  [[vm]]
+    memory = "256mb"
+    cpu_kind = "shared"
+    cpus = 1
+  
