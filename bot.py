@@ -33,6 +33,7 @@ cfg = load_config()
 db = Database(cfg.db_path)
 catalog = GiftCatalog()
 bot_username: str = ""
+admin_ids: set[int] = set()
 
 bot = Bot(token=cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -50,6 +51,9 @@ class GiftFlow(StatesGroup):
 class AdminFlow(StatesGroup):
     waiting_broadcast = State()
     waiting_find_user = State()
+    waiting_topup_amount = State()
+    waiting_add_admin = State()
+    waiting_remove_admin = State()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,6 +108,10 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="💬 Вкл/Выкл вопрос доната", callback_data="adm:toggle_donate_ask"),
             InlineKeyboardButton(text="⚙️ Все настройки", callback_data="adm:settings"),
+        ],
+        [
+            InlineKeyboardButton(text="💫 Пополнить звёзды", callback_data="adm:topup"),
+            InlineKeyboardButton(text="👑 Управление админами", callback_data="adm:admins"),
         ],
     ])
 
@@ -419,7 +427,7 @@ async def successful_payment(message: Message) -> None:
 # ── Admin callbacks ───────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
-    return user_id == cfg.admin_id
+    return user_id in admin_ids
 
 
 @router.callback_query(F.data == "adm:back")
@@ -866,6 +874,178 @@ async def adm_settings(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# ── Top-up stars ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "adm:topup")
+async def adm_topup(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminFlow.waiting_topup_amount)
+    await callback.message.edit_text(
+        "💫 <b>Пополнение баланса звёзд бота</b>\n\n"
+        "Введите количество звёзд для пополнения:\n"
+        "<i>Например: 50, 100, 500</i>",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_topup_amount, F.text)
+async def adm_topup_amount(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    try:
+        amount = int(message.text.strip())
+        if amount < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число больше 0.", reply_markup=back_keyboard())
+        return
+
+    try:
+        await bot.send_invoice(
+            chat_id=message.from_user.id,
+            title="💫 Пополнение баланса бота",
+            description=f"Пополнение баланса бота на {amount}⭐ для выдачи подарков",
+            payload=f"topup_{amount}",
+            currency="XTR",
+            prices=[LabeledPrice(label="Пополнение", amount=amount)],
+        )
+        await message.answer(
+            f"🧾 Счёт на {amount}⭐ отправлен выше.\n"
+            "После оплаты баланс бота пополнится автоматически."
+        )
+    except Exception as e:
+        logger.exception("Ошибка создания инвойса на пополнение: %s", e)
+        await message.answer(f"❌ Ошибка создания счёта: {e}", reply_markup=back_keyboard())
+
+
+# ── Admin management ──────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "adm:admins")
+async def adm_admins(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    extra = await db.get_extra_admins()
+    if extra:
+        admins_list = "\n".join(f"  • <code>{uid}</code>" for uid in extra)
+        text = f"👑 <b>Управление администраторами</b>\n\nДополнительные админы:\n{admins_list}"
+    else:
+        text = "👑 <b>Управление администраторами</b>\n\nДополнительных админов нет."
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить админа", callback_data="adm:add_admin")],
+            [InlineKeyboardButton(text="➖ Удалить админа", callback_data="adm:remove_admin")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:back")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:add_admin")
+async def adm_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    # Only main admin can add/remove admins
+    if callback.from_user.id != cfg.admin_id:
+        await callback.answer("Только главный администратор может управлять другими админами.", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_add_admin)
+    await callback.message.edit_text(
+        "➕ <b>Добавить администратора</b>\n\n"
+        "Введите Telegram ID пользователя, которого хотите сделать администратором:\n"
+        "<i>Попросите пользователя написать боту /start и найдите его ID в функции «Найти юзера»</i>",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_add_admin, F.text)
+async def adm_add_admin_confirm(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != cfg.admin_id:
+        return
+    await state.clear()
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите числовой Telegram ID.", reply_markup=back_keyboard())
+        return
+
+    if uid == cfg.admin_id:
+        await message.answer("ℹ️ Это уже главный администратор.", reply_markup=back_keyboard())
+        return
+
+    added = await db.add_admin(uid)
+    if added:
+        admin_ids.add(uid)
+        user = await db.get_user(uid)
+        name = f"@{user['username']}" if user and user.get("username") else f"ID {uid}"
+        await message.answer(
+            f"✅ <b>{name}</b> добавлен как администратор.\n"
+            "Теперь он имеет доступ к панели управления.",
+            reply_markup=back_keyboard(),
+        )
+        # Notify new admin
+        try:
+            await bot.send_message(uid, "👑 Вам выдан статус администратора бота!")
+        except Exception:
+            pass
+    else:
+        await message.answer(f"ℹ️ Пользователь <code>{uid}</code> уже является администратором.", reply_markup=back_keyboard())
+
+
+@router.callback_query(F.data == "adm:remove_admin")
+async def adm_remove_admin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    if callback.from_user.id != cfg.admin_id:
+        await callback.answer("Только главный администратор может удалять других админов.", show_alert=True)
+        return
+    extra = await db.get_extra_admins()
+    if not extra:
+        await callback.answer("Нет дополнительных администраторов.", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_remove_admin)
+    admins_list = "\n".join(f"  • <code>{uid}</code>" for uid in extra)
+    await callback.message.edit_text(
+        f"➖ <b>Удалить администратора</b>\n\nТекущие:\n{admins_list}\n\nВведите ID для удаления:",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_remove_admin, F.text)
+async def adm_remove_admin_confirm(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != cfg.admin_id:
+        return
+    await state.clear()
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите числовой Telegram ID.", reply_markup=back_keyboard())
+        return
+
+    removed = await db.remove_admin(uid)
+    if removed:
+        admin_ids.discard(uid)
+        await message.answer(
+            f"✅ Администратор <code>{uid}</code> удалён.",
+            reply_markup=back_keyboard(),
+        )
+        try:
+            await bot.send_message(uid, "ℹ️ Ваши права администратора были отозваны.")
+        except Exception:
+            pass
+    else:
+        await message.answer(
+            f"❌ Пользователь <code>{uid}</code> не найден среди администраторов.",
+            reply_markup=back_keyboard(),
+        )
+
+
 # ── Manual approve/reject (for pending requests) ──────────────────────────────
 
 @router.callback_query(F.data.startswith("approve:") | F.data.startswith("reject:"))
@@ -934,12 +1114,16 @@ async def handle_admin_decision(callback: CallbackQuery) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global bot_username
+    global bot_username, admin_ids
     await db.init()
     await catalog.load(bot)
     me = await bot.get_me()
     bot_username = me.username
-    logger.info("Gift bot @%s started for %s", bot_username, cfg.shop_name)
+    # Load all admin IDs (main + extra)
+    admin_ids = {cfg.admin_id}
+    extra = await db.get_extra_admins()
+    admin_ids.update(extra)
+    logger.info("Gift bot @%s started. Admins: %s", bot_username, admin_ids)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
