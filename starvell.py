@@ -33,20 +33,36 @@ class StarvellClient:
     # ── Auth helpers ───────────────────────────────────────────────────────────
 
     async def get_user_id(self) -> int | None:
+        """Get user ID from Starvell profile page (__NEXT_DATA__)."""
+        import re as _re
         async with aiohttp.ClientSession() as s:
-            try:
-                async with s.get(
-                    f"{BASE}/api/auth/session",
-                    headers=self._headers(),
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        uid = data.get("user", {}).get("id")
+            # Try profile/riyoshop-style slug pages to find current user ID
+            for path in ["/profile", "/profile/riyoshop"]:
+                try:
+                    async with s.get(
+                        f"{BASE}{path}",
+                        headers=self._headers(),
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as r:
+                        html = await r.text()
+                        m = _re.search(
+                            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                            html, _re.DOTALL,
+                        )
+                        if not m:
+                            continue
+                        data = json.loads(m.group(1))
+                        pp = data.get("props", {}).get("pageProps", {})
+                        uid = (
+                            (pp.get("user") or {}).get("id")
+                            or (pp.get("profile") or {}).get("id")
+                            or (pp.get("foreignProfileUser") or {}).get("id")
+                            or ((pp.get("bff") or {}).get("currentUser") or {}).get("id")
+                        )
                         if uid:
                             return int(uid)
-            except Exception as e:
-                logger.warning("get_user_id failed: %s", e)
+                except Exception as e:
+                    logger.warning("get_user_id(%s) failed: %s", path, e)
         return None
 
     async def get_build_id(self) -> str | None:
