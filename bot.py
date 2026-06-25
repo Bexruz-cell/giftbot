@@ -171,12 +171,12 @@ COMPLETION_TEXT = (
     "Буду рад видеть тебя снова! ☘️"
 )
 
-NOT_PURCHASED_TEXT = (
-    "❌ <b>Вы не приобрели товар.</b>\n\n"
-    "Чтобы получить подарок, сначала оформите заказ на сайте:\n"
-    f"👉 <a href='https://starvell.com/offers/233831'>Купить подарок</a>\n\n"
-    "После оплаты продавец отправит вам специальную ссылку для получения."
+SUPPORT_TEXT = (
+    "💙 Привет! Если нравится наш магазин — поддержи проект звёздами!\n"
+    "Это займёт секунду и очень поможет развитию 🚀"
 )
+
+NOT_PURCHASED_TEXT = SUPPORT_TEXT
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
 
     # Regular user without link
-    await message.answer(NOT_PURCHASED_TEXT, disable_web_page_preview=True)
+    await message.answer(NOT_PURCHASED_TEXT, reply_markup=donate_ask_keyboard(), disable_web_page_preview=True)
 
 
 # ── Gift comment flow ─────────────────────────────────────────────────────────
@@ -332,8 +332,7 @@ async def receive_comment(message: Message, state: FSMContext) -> None:
     if donate_ask_on:
         await asyncio.sleep(1)
         await message.answer(
-            "💙 Не хотите помочь моему проекту?\n"
-            "Это займёт всего секунду и очень поддержит развитие!",
+            SUPPORT_TEXT,
             reply_markup=donate_ask_keyboard(),
         )
 
