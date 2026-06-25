@@ -30,103 +30,94 @@ class StarvellClient:
             ),
         }
 
-    # ── Auth helpers ───────────────────────────────────────────────────────────
+    # ── Profile page helper ────────────────────────────────────────────────────
 
-    async def get_user_id(self) -> int | None:
-        """Get user ID from Starvell profile page (__NEXT_DATA__)."""
-        import re as _re
-        async with aiohttp.ClientSession() as s:
-            # Try profile/riyoshop-style slug pages to find current user ID
-            for path in ["/profile", "/profile/riyoshop"]:
-                try:
-                    async with s.get(
-                        f"{BASE}{path}",
-                        headers=self._headers(),
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as r:
-                        html = await r.text()
-                        m = _re.search(
-                            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                            html, _re.DOTALL,
-                        )
-                        if not m:
-                            continue
-                        data = json.loads(m.group(1))
-                        pp = data.get("props", {}).get("pageProps", {})
-                        uid = (
-                            (pp.get("user") or {}).get("id")
-                            or (pp.get("profile") or {}).get("id")
-                            or (pp.get("foreignProfileUser") or {}).get("id")
-                            or ((pp.get("bff") or {}).get("currentUser") or {}).get("id")
-                        )
-                        if uid:
-                            return int(uid)
-                except Exception as e:
-                    logger.warning("get_user_id(%s) failed: %s", path, e)
-        return None
-
-    async def get_build_id(self) -> str | None:
+    async def _fetch_next_data(self, path: str) -> dict[str, Any]:
+        """Fetch __NEXT_DATA__ JSON from any Starvell page."""
         async with aiohttp.ClientSession() as s:
             try:
                 async with s.get(
-                    BASE,
+                    f"{BASE}{path}",
                     headers=self._headers(),
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as r:
                     html = await r.text()
                     m = re.search(
                         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                        html,
-                        re.DOTALL,
+                        html, re.DOTALL,
                     )
                     if m:
-                        data = json.loads(m.group(1))
-                        return data.get("buildId")
+                        return json.loads(m.group(1))
             except Exception as e:
-                logger.warning("get_build_id failed: %s", e)
+                logger.warning("_fetch_next_data(%s) failed: %s", path, e)
+        return {}
+
+    # ── Auth helpers ───────────────────────────────────────────────────────────
+
+    async def get_user_info(self) -> dict[str, Any] | None:
+        """Return {id, username} from profile page __NEXT_DATA__."""
+        for slug in ["riyoshop"]:
+            nd = await self._fetch_next_data(f"/profile/{slug}")
+            pp = nd.get("props", {}).get("pageProps", {})
+            # foreignProfileUser has the profile owner's info
+            fpu = pp.get("foreignProfileUser") or {}
+            uid = fpu.get("id")
+            username = fpu.get("username") or slug
+            if uid:
+                return {"id": int(uid), "username": username}
+            # fallback: bff.currentUser
+            cu = (pp.get("bff") or {}).get("currentUser") or {}
+            if cu.get("id"):
+                return {"id": int(cu["id"]), "username": cu.get("username", slug)}
         return None
+
+    async def get_user_id(self) -> int | None:
+        info = await self.get_user_info()
+        return info["id"] if info else None
 
     # ── Offers ────────────────────────────────────────────────────────────────
 
-    async def fetch_offers(self, user_id: int, build_id: str) -> list[dict[str, Any]]:
-        url = f"{BASE}/_next/data/{build_id}/users/{user_id}.json?user_id={user_id}"
-        async with aiohttp.ClientSession() as s:
-            try:
-                async with s.get(
-                    url,
-                    headers={**self._headers(), "x-nextjs-data": "1"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as r:
-                    if r.status != 200:
-                        return []
-                    data = await r.json()
-                    page = data.get("pageProps", {})
-                    categories = (
-                        page.get("categoriesWithOffers")
-                        or page.get("userProfileOffers")
-                        or (page.get("bff") or {}).get("userProfileOffers")
-                        or []
-                    )
-                    offers: list[dict[str, Any]] = []
-                    for cat in categories:
-                        game_id = cat.get("gameId") or (cat.get("game") or {}).get("id")
-                        cat_id = cat.get("id")
-                        for offer in cat.get("offers", []):
-                            offers.append(
-                                {
-                                    "id": offer.get("id"),
-                                    "gameId": game_id,
-                                    "categoryId": cat_id,
-                                    "title": (offer.get("descriptions") or {})
-                                    .get("rus", {})
-                                    .get("briefDescription", ""),
-                                    "price": offer.get("price"),
-                                }
-                            )
-                    return offers
-            except Exception as e:
-                logger.warning("fetch_offers failed: %s", e)
-        return []
+    async def fetch_offers(self) -> list[dict[str, Any]]:
+        """
+        Fetch active lots from the seller's profile page.
+        Structure: userProfileOffers = list of categories, each with nested offers[].
+        """
+        info = await self.get_user_info()
+        if not info:
+            logger.warning("fetch_offers: could not get user info")
+            return []
+
+        slug = info["username"].lower()
+        nd = await self._fetch_next_data(f"/profile/{slug}")
+        pp = nd.get("props", {}).get("pageProps", {})
+
+        raw_categories: list[dict[str, Any]] = (
+            pp.get("userProfileOffers")
+            or pp.get("categoriesWithOffers")
+            or (pp.get("bff") or {}).get("userProfileOffers")
+            or []
+        )
+
+        offers: list[dict[str, Any]] = []
+        for cat in raw_categories:
+            game_id = cat.get("gameId") or (cat.get("game") or {}).get("id")
+            cat_id = cat.get("id")
+            nested = cat.get("offers") or []
+            if not game_id or not cat_id:
+                continue
+            for offer in nested:
+                offers.append({
+                    "id": offer.get("id"),
+                    "gameId": game_id,
+                    "categoryId": cat_id,
+                    "title": (offer.get("descriptions") or {})
+                    .get("rus", {})
+                    .get("briefDescription", cat.get("name", "")),
+                    "price": offer.get("price"),
+                })
+
+        logger.info("fetch_offers: found %d offers in %d categories", len(offers), len(raw_categories))
+        return offers
 
     def _group_offers(self, offers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
@@ -173,15 +164,7 @@ class StarvellClient:
 
     async def bump_lots(self) -> dict[str, Any]:
         """Bump all active lots. Returns result summary."""
-        user_id = await self.get_user_id()
-        if not user_id:
-            return {"ok": False, "error": "Не удалось получить ID пользователя Starvell. Проверьте cookie."}
-
-        build_id = await self.get_build_id()
-        if not build_id:
-            return {"ok": False, "error": "Не удалось получить buildId сайта."}
-
-        offers = await self.fetch_offers(user_id, build_id)
+        offers = await self.fetch_offers()
         if not offers:
             return {"ok": False, "error": "Активных лотов не найдено."}
 
@@ -195,6 +178,7 @@ class StarvellClient:
                 if result["ok"]:
                     success += 1
                 else:
+                    logger.warning("bump failed for game %s: %s", p["gameId"], result)
                     failed += 1
                 if i < len(payloads) - 1:
                     await asyncio.sleep(2)
