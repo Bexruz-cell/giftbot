@@ -1167,11 +1167,18 @@ async def adm_bump_cookie(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminFlow.waiting_bump_cookie)
     await callback.message.edit_text(
         "🍪 <b>Введи Cookie Starvell</b>\n\n"
-        "Как получить:\n"
-        "1. Зайди на starvell.com и войди в аккаунт\n"
-        "2. Открой DevTools (F12) → Application → Cookies → starvell.com\n"
-        "3. Скопируй всю строку cookies (все значения через ; )\n\n"
-        "Отправь строку сюда:",
+        "Нужна строка вида:\n"
+        "<code>name1=value1; name2=value2; name3=value3</code>\n\n"
+        "📱 <b>На Android (самый простой способ):</b>\n"
+        "1. Скачай <b>Kiwi Browser</b> (Google Play, бесплатно)\n"
+        "2. В Kiwi установи расширение <b>EditThisCookie</b>\n"
+        "3. Зайди на starvell.com → войди в аккаунт\n"
+        "4. Нажми на значок расширения → <b>Export</b> → скопируй строку\n\n"
+        "🖥 <b>На компьютере:</b>\n"
+        "F12 → Application → Cookies → starvell.com\n"
+        "Скопируй строку из поля <b>Cookie</b> в заголовках любого запроса\n"
+        "(Вкладка Network → любой запрос к starvell.com → Headers → Cookie)\n\n"
+        "⚠️ <b>Важно:</b> нужна ПОЛНАЯ строка со всеми cookie через ; — не одно значение!",
         reply_markup=back_keyboard(),
     )
     await callback.answer()
