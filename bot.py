@@ -22,6 +22,7 @@ from aiogram.types import (
 from config import PRODUCTS, get_product, load_config
 from database import Database, RequestStatus
 from gifts import GiftCatalog, deliver_gift
+from starvell import StarvellClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,11 @@ class AdminFlow(StatesGroup):
     waiting_topup_amount = State()
     waiting_add_admin = State()
     waiting_remove_admin = State()
+    waiting_bump_cookie = State()
+    waiting_bump_interval = State()
+    waiting_ar_keyword = State()
+    waiting_ar_reply = State()
+    waiting_ar_delete = State()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,6 +118,10 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="💫 Пополнить звёзды", callback_data="adm:topup"),
             InlineKeyboardButton(text="👑 Управление админами", callback_data="adm:admins"),
+        ],
+        [
+            InlineKeyboardButton(text="🚀 Авто-поднятие Starvell", callback_data="adm:bump"),
+            InlineKeyboardButton(text="💬 Авто-ответы", callback_data="adm:autoreplies"),
         ],
     ])
 
@@ -193,7 +203,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
 
     # Admin panel
-    if user.id == cfg.admin_id:
+    if is_admin(user.id):
         gifts_on = await db.is_gifts_enabled()
         status_icon = "✅" if gifts_on else "❌"
         await message.answer(
@@ -1116,6 +1126,361 @@ async def handle_admin_decision(callback: CallbackQuery) -> None:
     await bot.send_message(user_id, COMPLETION_TEXT)
 
 
+# ── Starvell auto-bump ────────────────────────────────────────────────────────
+
+def bump_status_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⏹ Остановить авто-поднятие" if enabled else "▶️ Запустить авто-поднятие"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Поднять прямо сейчас", callback_data="adm:bump_now")],
+        [InlineKeyboardButton(text=toggle_text, callback_data="adm:bump_toggle")],
+        [InlineKeyboardButton(text="🍪 Задать Cookie Starvell", callback_data="adm:bump_cookie")],
+        [InlineKeyboardButton(text="⏱ Интервал поднятия", callback_data="adm:bump_interval")],
+        [InlineKeyboardButton(text="📊 Статистика Starvell", callback_data="adm:starvell_stats")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:back")],
+    ])
+
+
+@router.callback_query(F.data == "adm:bump")
+async def adm_bump_menu(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    enabled = (await db.get_setting("auto_bump_enabled")) == "1"
+    interval = await db.get_setting("auto_bump_interval")
+    cookie = await db.get_setting("starvell_cookie")
+    cookie_status = "✅ Задан" if cookie else "❌ Не задан"
+    await callback.message.edit_text(
+        f"🚀 <b>Авто-поднятие Starvell</b>\n\n"
+        f"Статус: {'✅ Работает' if enabled else '⏹ Остановлено'}\n"
+        f"Интервал: <b>{interval} мин</b>\n"
+        f"Cookie: <b>{cookie_status}</b>\n\n"
+        f"<i>Cookie нужен для авторизации на Starvell.\n"
+        f"Возьми его из браузера: DevTools → Application → Cookies → starvell.com</i>",
+        reply_markup=bump_status_keyboard(enabled),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:bump_cookie")
+async def adm_bump_cookie(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminFlow.waiting_bump_cookie)
+    await callback.message.edit_text(
+        "🍪 <b>Введи Cookie Starvell</b>\n\n"
+        "Как получить:\n"
+        "1. Зайди на starvell.com и войди в аккаунт\n"
+        "2. Открой DevTools (F12) → Application → Cookies → starvell.com\n"
+        "3. Скопируй всю строку cookies (все значения через ; )\n\n"
+        "Отправь строку сюда:",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_bump_cookie, F.text)
+async def adm_bump_cookie_set(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    cookie = message.text.strip()
+    await db.set_setting("starvell_cookie", cookie)
+    await message.answer(
+        "✅ Cookie сохранён!\n\n"
+        "Попробуй <b>Поднять прямо сейчас</b> чтобы проверить что всё работает.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К авто-поднятию", callback_data="adm:bump")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm:bump_interval")
+async def adm_bump_interval(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    current = await db.get_setting("auto_bump_interval")
+    await state.set_state(AdminFlow.waiting_bump_interval)
+    await callback.message.edit_text(
+        f"⏱ <b>Интервал авто-поднятия</b>\n\nТекущий: <b>{current} мин</b>\n\n"
+        "Введи новый интервал в минутах (минимум 15):",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_bump_interval, F.text)
+async def adm_bump_interval_set(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    try:
+        mins = int(message.text.strip())
+        if mins < 15:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи число минут (минимум 15).", reply_markup=back_keyboard())
+        return
+    await db.set_setting("auto_bump_interval", str(mins))
+    await message.answer(
+        f"✅ Интервал установлен: <b>{mins} мин</b>\n"
+        "Перезапусти авто-поднятие чтобы применилось.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К авто-поднятию", callback_data="adm:bump")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm:bump_toggle")
+async def adm_bump_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    enabled = (await db.get_setting("auto_bump_enabled")) == "1"
+    new_val = "0" if enabled else "1"
+    await db.set_setting("auto_bump_enabled", new_val)
+    if new_val == "1":
+        cookie = await db.get_setting("starvell_cookie")
+        if not cookie:
+            await db.set_setting("auto_bump_enabled", "0")
+            await callback.answer("❌ Сначала задай Cookie Starvell!", show_alert=True)
+            return
+        await callback.answer("✅ Авто-поднятие запущено!")
+    else:
+        await callback.answer("⏹ Авто-поднятие остановлено.")
+    await adm_bump_menu(callback)
+
+
+@router.callback_query(F.data == "adm:bump_now")
+async def adm_bump_now(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    cookie = await db.get_setting("starvell_cookie")
+    if not cookie:
+        await callback.answer("❌ Сначала задай Cookie Starvell!", show_alert=True)
+        return
+    await callback.answer("⏳ Поднимаю лоты...")
+    await callback.message.edit_text("⏳ Поднимаю лоты, подождите...")
+    client = StarvellClient(cookie)
+    result = await client.bump_lots()
+    if result.get("ok"):
+        text = (
+            f"✅ <b>Лоты подняты!</b>\n\n"
+            f"Офферов: {result.get('total_offers', 0)}\n"
+            f"Групп: {result.get('groups', 0)}\n"
+            f"Успешно: {result.get('success', 0)}\n"
+            f"Ошибок: {result.get('failed', 0)}"
+        )
+    else:
+        text = f"❌ <b>Ошибка поднятия</b>\n\n{result.get('error', 'Неизвестная ошибка')}"
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К авто-поднятию", callback_data="adm:bump")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm:starvell_stats")
+async def adm_starvell_stats(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    cookie = await db.get_setting("starvell_cookie")
+    if not cookie:
+        await callback.answer("❌ Сначала задай Cookie Starvell!", show_alert=True)
+        return
+    await callback.answer("⏳ Загружаю статистику...")
+    await callback.message.edit_text("⏳ Загружаю статистику Starvell...")
+    client = StarvellClient(cookie)
+    stats = await client.get_stats()
+    if "error" in stats:
+        text = f"❌ <b>Ошибка</b>\n\n{stats['error']}"
+    else:
+        reviews = stats.get("reviews", {})
+        pos = reviews.get("positive", 0) if isinstance(reviews, dict) else 0
+        neg = reviews.get("negative", 0) if isinstance(reviews, dict) else 0
+        total_r = reviews.get("total", pos + neg) if isinstance(reviews, dict) else 0
+        text = (
+            f"📊 <b>Статистика Starvell</b>\n\n"
+            f"🆔 User ID: <code>{stats.get('user_id', '—')}</code>\n"
+            f"📦 Заказов создано: <b>{stats.get('orders_count', '—')}</b>\n"
+            f"⭐ Отзывов: <b>{total_r}</b> (👍{pos} / 👎{neg})\n"
+            f"💬 Непрочитанных чатов: <b>{stats.get('unread_chats', '—')}</b>"
+        )
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К авто-поднятию", callback_data="adm:bump")],
+        ]),
+    )
+
+
+# ── Auto-replies ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "adm:autoreplies")
+async def adm_autoreplies(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    replies = await db.get_auto_replies()
+    if replies:
+        lines = "\n".join(
+            f"  <b>{r['id']}.</b> <code>{r['keyword']}</code> → {r['reply_text'][:40]}…"
+            if len(r['reply_text']) > 40
+            else f"  <b>{r['id']}.</b> <code>{r['keyword']}</code> → {r['reply_text']}"
+            for r in replies
+        )
+        text = f"💬 <b>Авто-ответы</b> ({len(replies)} шт.)\n\n{lines}"
+    else:
+        text = "💬 <b>Авто-ответы</b>\n\nПока нет ни одного авто-ответа."
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить", callback_data="adm:ar_add")],
+            [InlineKeyboardButton(text="➖ Удалить по номеру", callback_data="adm:ar_delete")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:back")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:ar_add")
+async def adm_ar_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminFlow.waiting_ar_keyword)
+    await callback.message.edit_text(
+        "➕ <b>Новый авто-ответ</b>\n\n"
+        "Шаг 1/2: Введи <b>ключевое слово</b> (или фразу).\n"
+        "Когда пользователь напишет что-то содержащее это слово — бот ответит автоматически.\n\n"
+        "<i>Например: цена, доставка, привет, помощь</i>",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_ar_keyword, F.text)
+async def adm_ar_keyword(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(keyword=message.text.strip())
+    await state.set_state(AdminFlow.waiting_ar_reply)
+    await message.answer(
+        f"✅ Ключевое слово: <code>{message.text.strip()}</code>\n\n"
+        "Шаг 2/2: Введи <b>текст ответа</b>, который получит пользователь:",
+        reply_markup=back_keyboard(),
+    )
+
+
+@router.message(AdminFlow.waiting_ar_reply, F.text)
+async def adm_ar_reply(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    keyword = data.get("keyword", "")
+    await state.clear()
+    ok = await db.add_auto_reply(keyword, message.text.strip())
+    if ok:
+        await message.answer(
+            f"✅ <b>Авто-ответ добавлен!</b>\n\n"
+            f"Слово: <code>{keyword}</code>\n"
+            f"Ответ: {message.text.strip()}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Список авто-ответов", callback_data="adm:autoreplies")],
+            ]),
+        )
+    else:
+        await message.answer(
+            f"❌ Ключевое слово <code>{keyword}</code> уже существует.",
+            reply_markup=back_keyboard(),
+        )
+
+
+@router.callback_query(F.data == "adm:ar_delete")
+async def adm_ar_delete(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    replies = await db.get_auto_replies()
+    if not replies:
+        await callback.answer("Нет авто-ответов для удаления.", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_ar_delete)
+    lines = "\n".join(f"  <b>{r['id']}.</b> <code>{r['keyword']}</code>" for r in replies)
+    await callback.message.edit_text(
+        f"➖ <b>Удалить авто-ответ</b>\n\n{lines}\n\nВведи <b>номер</b> для удаления:",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlow.waiting_ar_delete, F.text)
+async def adm_ar_delete_confirm(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    try:
+        rid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введи числовой ID.", reply_markup=back_keyboard())
+        return
+    removed = await db.remove_auto_reply(rid)
+    if removed:
+        await message.answer(
+            f"✅ Авто-ответ #{rid} удалён.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Список авто-ответов", callback_data="adm:autoreplies")],
+            ]),
+        )
+    else:
+        await message.answer(f"❌ Авто-ответ #{rid} не найден.", reply_markup=back_keyboard())
+
+
+# ── Auto-reply handler for regular users ──────────────────────────────────────
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def auto_reply_handler(message: Message, state: FSMContext) -> None:
+    if is_admin(message.from_user.id):
+        return
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+    reply = await db.find_auto_reply(message.text)
+    if reply:
+        await message.answer(reply)
+
+
+# ── Auto-bump background task ─────────────────────────────────────────────────
+
+async def auto_bump_loop() -> None:
+    logger.info("Auto-bump background task started.")
+    while True:
+        try:
+            enabled = (await db.get_setting("auto_bump_enabled")) == "1"
+            interval_min = int(await db.get_setting("auto_bump_interval") or "30")
+            if enabled:
+                cookie = await db.get_setting("starvell_cookie")
+                if cookie:
+                    client = StarvellClient(cookie)
+                    result = await client.bump_lots()
+                    if result.get("ok"):
+                        msg = (
+                            f"🚀 <b>Авто-поднятие выполнено</b>\n"
+                            f"Офферов: {result.get('total_offers', 0)}, "
+                            f"групп: {result.get('groups', 0)}"
+                        )
+                    else:
+                        msg = f"⚠️ <b>Авто-поднятие: ошибка</b>\n{result.get('error', '?')}"
+                    try:
+                        await bot.send_message(cfg.admin_id, msg)
+                    except Exception:
+                        pass
+                    logger.info("Auto-bump result: %s", result)
+                else:
+                    logger.warning("Auto-bump enabled but no cookie set.")
+            await asyncio.sleep(interval_min * 60)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception("Auto-bump loop error: %s", e)
+            await asyncio.sleep(60)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -1130,6 +1495,8 @@ async def main() -> None:
     admin_ids.update(extra)
     logger.info("Gift bot @%s started. Admins: %s", bot_username, admin_ids)
     await bot.delete_webhook(drop_pending_updates=True)
+    # Start auto-bump background task
+    asyncio.create_task(auto_bump_loop())
     await dp.start_polling(bot)
 
 
