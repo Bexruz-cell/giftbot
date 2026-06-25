@@ -72,6 +72,16 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('gifts_enabled', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_enabled', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('donation_ask_enabled', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('extra_admins', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('starvell_cookie', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_bump_enabled', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_bump_interval', '30');
+
+CREATE TABLE IF NOT EXISTS auto_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword TEXT NOT NULL UNIQUE,
+    reply_text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -153,6 +163,45 @@ class Database:
         admins = [a for a in admins if a != user_id]
         await self.set_setting("extra_admins", ",".join(str(a) for a in admins))
         return True
+
+    # ── Auto-replies ──────────────────────────────────────────────────────────
+
+    async def get_auto_replies(self) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, keyword, reply_text FROM auto_replies ORDER BY id"
+            ) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def add_auto_reply(self, keyword: str, reply_text: str) -> bool:
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "INSERT INTO auto_replies (keyword, reply_text) VALUES (?, ?)",
+                    (keyword.lower().strip(), reply_text),
+                )
+                await db.commit()
+            return True
+        except Exception:
+            return False
+
+    async def remove_auto_reply(self, reply_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("DELETE FROM auto_replies WHERE id = ?", (reply_id,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def find_auto_reply(self, text: str) -> str | None:
+        text_lower = text.lower()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT keyword, reply_text FROM auto_replies") as cur:
+                async for row in cur:
+                    if row["keyword"] in text_lower:
+                        return row["reply_text"]
+        return None
 
     # ── Users ─────────────────────────────────────────────────────────────────
 
