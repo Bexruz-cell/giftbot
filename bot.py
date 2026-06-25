@@ -41,6 +41,10 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# Per-user auto-reply cooldown: user_id -> last_reply_timestamp
+_ar_cooldown: dict[int, float] = {}
+_AR_COOLDOWN_SECS = 30
+
 
 # ── States ────────────────────────────────────────────────────────────────────
 
@@ -69,8 +73,14 @@ def gen_code(length: int = 10) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def admin_main_keyboard() -> InlineKeyboardMarkup:
+def admin_main_keyboard(paused: bool = False) -> InlineKeyboardMarkup:
+    pause_btn = (
+        InlineKeyboardButton(text="▶️ Включить всё", callback_data="adm:toggle_pause")
+        if paused
+        else InlineKeyboardButton(text="⏸ Выключить всё", callback_data="adm:toggle_pause")
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
+        [pause_btn],
         [
             InlineKeyboardButton(text="🔗 Создать ссылку", callback_data="adm:create_link"),
             InlineKeyboardButton(text="📋 Мои ссылки", callback_data="adm:my_links"),
@@ -205,12 +215,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # Admin panel
     if is_admin(user.id):
         gifts_on = await db.is_gifts_enabled()
+        paused = (await db.get_setting("bot_paused")) == "1"
         status_icon = "✅" if gifts_on else "❌"
+        pause_line = "\n⏸ <b>БОТ НА ПАУЗЕ — все функции выключены</b>" if paused else ""
         await message.answer(
             f"👋 Привет, администратор!\n\n"
-            f"🎁 Приём подарков: <b>{status_icon} {'включён' if gifts_on else 'выключен'}</b>\n\n"
+            f"🎁 Приём подарков: <b>{status_icon} {'включён' if gifts_on else 'выключен'}</b>"
+            f"{pause_line}\n\n"
             f"Выберите действие:",
-            reply_markup=admin_main_keyboard(),
+            reply_markup=admin_main_keyboard(paused=paused),
         )
         return
 
@@ -252,6 +265,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(GiftFlow.waiting_comment, F.text)
 async def receive_comment(message: Message, state: FSMContext) -> None:
+    # Check global pause
+    if (await db.get_setting("bot_paused")) == "1":
+        await message.answer("⏸ Бот временно приостановлен. Попробуйте позже.")
+        await state.clear()
+        return
     comment = message.text.strip()
     if not comment:
         await message.answer("Комментарий не может быть пустым. Введите текст.")
@@ -451,13 +469,39 @@ async def adm_back(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
     gifts_on = await db.is_gifts_enabled()
+    paused = (await db.get_setting("bot_paused")) == "1"
     icon = "✅" if gifts_on else "❌"
+    pause_line = "\n⏸ <b>БОТ НА ПАУЗЕ — все функции выключены</b>" if paused else ""
     await callback.message.edit_text(
         f"👋 Панель администратора\n\n"
-        f"🎁 Приём подарков: <b>{icon} {'включён' if gifts_on else 'выключен'}</b>",
-        reply_markup=admin_main_keyboard(),
+        f"🎁 Приём подарков: <b>{icon} {'включён' if gifts_on else 'выключен'}</b>"
+        f"{pause_line}",
+        reply_markup=admin_main_keyboard(paused=paused),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm:toggle_pause")
+async def adm_toggle_pause(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    paused = (await db.get_setting("bot_paused")) == "1"
+    new_paused = not paused
+    await db.set_setting("bot_paused", "1" if new_paused else "0")
+    gifts_on = await db.is_gifts_enabled()
+    icon = "✅" if gifts_on else "❌"
+    if new_paused:
+        pause_line = "\n⏸ <b>БОТ НА ПАУЗЕ — все функции выключены</b>"
+        await callback.answer("⏸ Все функции выключены!", show_alert=True)
+    else:
+        pause_line = ""
+        await callback.answer("▶️ Все функции включены!")
+    await callback.message.edit_text(
+        f"👋 Панель администратора\n\n"
+        f"🎁 Приём подарков: <b>{icon} {'включён' if gifts_on else 'выключен'}</b>"
+        f"{pause_line}",
+        reply_markup=admin_main_keyboard(paused=new_paused),
+    )
 
 
 @router.callback_query(F.data == "adm:create_link")
@@ -1442,13 +1486,23 @@ async def adm_ar_delete_confirm(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def auto_reply_handler(message: Message, state: FSMContext) -> None:
+    import time as _time
     if is_admin(message.from_user.id):
         return
     current_state = await state.get_state()
     if current_state is not None:
         return
+    # Don't reply while bot is paused
+    if (await db.get_setting("bot_paused")) == "1":
+        return
+    # Per-user cooldown — max 1 auto-reply per user per 30 seconds
+    uid = message.from_user.id
+    now = _time.monotonic()
+    if now - _ar_cooldown.get(uid, 0) < _AR_COOLDOWN_SECS:
+        return
     reply = await db.find_auto_reply(message.text)
     if reply:
+        _ar_cooldown[uid] = now
         await message.answer(reply)
 
 
@@ -1460,7 +1514,8 @@ async def auto_bump_loop() -> None:
         try:
             enabled = (await db.get_setting("auto_bump_enabled")) == "1"
             interval_min = int(await db.get_setting("auto_bump_interval") or "30")
-            if enabled:
+            paused = (await db.get_setting("bot_paused")) == "1"
+            if enabled and not paused:
                 cookie = await db.get_setting("starvell_cookie")
                 if cookie:
                     client = StarvellClient(cookie)
